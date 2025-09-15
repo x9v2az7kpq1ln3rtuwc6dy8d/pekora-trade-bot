@@ -1,0 +1,857 @@
+import net.dv8tion.jda.api.EmbedBuilder;
+import net.dv8tion.jda.api.JDA;
+import net.dv8tion.jda.api.JDABuilder;
+import net.dv8tion.jda.api.Permission;
+import net.dv8tion.jda.api.entities.Guild;
+import net.dv8tion.jda.api.entities.Member;
+import net.dv8tion.jda.api.entities.Role;
+import net.dv8tion.jda.api.entities.User;
+import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
+import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
+import net.dv8tion.jda.api.events.session.ReadyEvent;
+import net.dv8tion.jda.api.hooks.ListenerAdapter;
+import net.dv8tion.jda.api.interactions.commands.OptionType;
+import net.dv8tion.jda.api.interactions.commands.build.Commands;
+import net.dv8tion.jda.api.interactions.commands.build.OptionData;
+import net.dv8tion.jda.api.interactions.components.buttons.Button;
+import net.dv8tion.jda.api.requests.GatewayIntent;
+import net.dv8tion.jda.api.utils.ChunkingFilter;
+import net.dv8tion.jda.api.utils.MemberCachePolicy;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import com.opencsv.CSVWriter;
+
+import java.awt.Color;
+import java.io.*;
+import java.lang.reflect.Type;
+import java.sql.*;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Discord Trade Evaluation Bot - Java Version
+ * A bot for evaluating ROBLOX item trades with demand-based value adjustments.
+ */
+public class DiscordTradeBot extends ListenerAdapter {
+    
+    private static final String DB_PATH = "./pekora.db";
+    private static final Gson gson = new Gson();
+    private static final String ADMIN_ROLE_NAME = System.getenv().getOrDefault("ADMIN_ROLE", "Trade Admin");
+    
+    // Default demand biases
+    private static final Map<String, Double> DEFAULT_BIASES = new HashMap<String, Double>() {{
+        put("high", 1.1);
+        put("normal", 1.0);
+        put("low", 0.9);
+        put("terrible", 0.8);
+        put("rising", 1.2);
+        put("ok", 1.0);
+    }};
+    
+    public static void main(String[] args) {
+        String token = System.getenv("DISCORD_TOKEN");
+        if (token == null || token.isEmpty()) {
+            System.err.println("DISCORD_TOKEN environment variable not found!");
+            return;
+        }
+        
+        try {
+            // Initialize database
+            initializeDatabase();
+            seedDatabase();
+            
+            // Create JDA instance
+            JDA jda = JDABuilder.createDefault(token)
+                    .setChunkingFilter(ChunkingFilter.ALL)
+                    .setMemberCachePolicy(MemberCachePolicy.ALL)
+                    .enableIntents(GatewayIntent.GUILD_MEMBERS)
+                    .addEventListeners(new DiscordTradeBot())
+                    .build();
+                    
+            // Register slash commands
+            registerCommands(jda);
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+    
+    @Override
+    public void onReady(ReadyEvent event) {
+        System.out.println("Logged in as " + event.getJDA().getSelfUser().getAsTag());
+    }
+    
+    @Override
+    public void onSlashCommandInteraction(SlashCommandInteractionEvent event) {
+        try {
+            switch (event.getName()) {
+                case "evaluate":
+                    handleEvaluate(event);
+                    break;
+                case "item_add":
+                    handleItemAdd(event);
+                    break;
+                case "item_update":
+                    handleItemUpdate(event);
+                    break;
+                case "item_remove":
+                    handleItemRemove(event);
+                    break;
+                case "list_export":
+                    handleListExport(event);
+                    break;
+                case "history":
+                    handleHistory(event);
+                    break;
+                case "set_bias":
+                    handleSetBias(event);
+                    break;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            if (event.isAcknowledged()) {
+                event.getHook().editOriginal("Error: " + e.getMessage()).queue();
+            } else {
+                event.reply("Error: " + e.getMessage()).setEphemeral(true).queue();
+            }
+        }
+    }
+    
+    @Override
+    public void onButtonInteraction(ButtonInteractionEvent event) {
+        try {
+            switch (event.getComponentId()) {
+                case "accept_trade":
+                    updateLastHistoryVerdict("Manual Accept");
+                    event.editMessage("✅ You marked this trade as **accepted**. Logged.")
+                         .setComponents().queue();
+                    break;
+                case "decline_trade":
+                    updateLastHistoryVerdict("Manual Decline");
+                    event.editMessage("❌ You marked this trade as **declined**. Logged.")
+                         .setComponents().queue();
+                    break;
+                case "counter_trade":
+                    updateLastHistoryVerdict("Manual Counter Suggested");
+                    event.editMessage("💡 **Suggested counter**: Check the evaluation suggestions above.")
+                         .setComponents().queue();
+                    break;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            event.reply("Error: " + e.getMessage()).setEphemeral(true).queue();
+        }
+    }
+    
+    private void handleEvaluate(SlashCommandInteractionEvent event) {
+        event.deferReply().queue();
+        
+        String yourItems = event.getOption("your_items").getAsString();
+        String theirItems = event.getOption("their_items").getAsString();
+        String proof = event.getOption("proof") != null ? event.getOption("proof").getAsString() : null;
+        
+        List<String> yourItemsList = parseItemsCSV(yourItems);
+        List<String> theirItemsList = parseItemsCSV(theirItems);
+        
+        TradeEvaluation evaluation = evaluateTradeLogic(yourItemsList, theirItemsList);
+        
+        // Save to history
+        addToHistory(event.getUser().getId(), yourItemsList, theirItemsList, 
+                    evaluation.yourValue, evaluation.theirValue, evaluation.verdict, proof);
+        
+        EmbedBuilder embed = buildEvaluationEmbed(event.getUser(), evaluation, proof);
+        
+        // Create buttons
+        List<Button> buttons = Arrays.asList(
+            Button.success("accept_trade", "Accept"),
+            Button.danger("decline_trade", "Decline"),
+            Button.primary("counter_trade", "Suggest Counter")
+        );
+        
+        event.getHook().editOriginalEmbeds(embed.build())
+             .setActionRow(buttons).queue();
+    }
+    
+    private void handleItemAdd(SlashCommandInteractionEvent event) {
+        if (!isAdmin(event.getMember())) {
+            event.reply("Admin only.").setEphemeral(true).queue();
+            return;
+        }
+        
+        String name = event.getOption("name").getAsString();
+        int value = event.getOption("value").getAsInt();
+        String demand = event.getOption("demand").getAsString();
+        
+        try {
+            addItem(name, value, demand);
+            event.reply("✅ Added item **" + name + "** = " + value + " (" + demand + ")")
+                 .setEphemeral(true).queue();
+        } catch (SQLException e) {
+            event.reply("❌ Failed to add: " + e.getMessage()).setEphemeral(true).queue();
+        }
+    }
+    
+    private void handleItemUpdate(SlashCommandInteractionEvent event) {
+        if (!isAdmin(event.getMember())) {
+            event.reply("Admin only.").setEphemeral(true).queue();
+            return;
+        }
+        
+        String name = event.getOption("name").getAsString();
+        Integer value = event.getOption("value") != null ? event.getOption("value").getAsInt() : null;
+        String demand = event.getOption("demand") != null ? event.getOption("demand").getAsString() : null;
+        
+        try {
+            updateItem(name, value, demand);
+            event.reply("✅ Updated **" + name + "**").setEphemeral(true).queue();
+        } catch (SQLException e) {
+            event.reply("❌ Failed to update: " + e.getMessage()).setEphemeral(true).queue();
+        }
+    }
+    
+    private void handleItemRemove(SlashCommandInteractionEvent event) {
+        if (!isAdmin(event.getMember())) {
+            event.reply("Admin only.").setEphemeral(true).queue();
+            return;
+        }
+        
+        String name = event.getOption("name").getAsString();
+        
+        try {
+            removeItem(name);
+            event.reply("✅ Removed **" + name + "** (if existed)").setEphemeral(true).queue();
+        } catch (SQLException e) {
+            event.reply("❌ Failed to remove: " + e.getMessage()).setEphemeral(true).queue();
+        }
+    }
+    
+    private void handleListExport(SlashCommandInteractionEvent event) {
+        if (!isAdmin(event.getMember())) {
+            event.reply("Admin only.").setEphemeral(true).queue();
+            return;
+        }
+        
+        try {
+            List<Item> items = getAllItems();
+            
+            // Create CSV
+            StringWriter stringWriter = new StringWriter();
+            CSVWriter csvWriter = new CSVWriter(stringWriter);
+            
+            // Write header
+            csvWriter.writeNext(new String[]{"name", "value", "demand"});
+            
+            // Write data
+            for (Item item : items) {
+                csvWriter.writeNext(new String[]{item.name, String.valueOf(item.value), item.demand});
+            }
+            csvWriter.close();
+            
+            byte[] csvBytes = stringWriter.toString().getBytes();
+            event.replyFiles(net.dv8tion.jda.api.utils.FileUpload.fromData(csvBytes, "value_list.csv"))
+                 .setEphemeral(true).queue();
+                 
+        } catch (Exception e) {
+            event.reply("❌ Failed to export: " + e.getMessage()).setEphemeral(true).queue();
+        }
+    }
+    
+    private void handleHistory(SlashCommandInteractionEvent event) {
+        int limit = event.getOption("limit") != null ? 
+                   Math.min(event.getOption("limit").getAsInt(), 50) : 10;
+        
+        try {
+            List<HistoryRecord> history = getHistory(limit);
+            
+            if (history.isEmpty()) {
+                event.reply("No history found.").setEphemeral(true).queue();
+                return;
+            }
+            
+            StringBuilder content = new StringBuilder();
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+                                                          .withZone(ZoneId.of("Europe/Oslo"));
+            
+            for (int i = 0; i < Math.min(history.size(), 20); i++) {
+                HistoryRecord record = history.get(i);
+                String date = formatter.format(Instant.ofEpochMilli(record.timestamp));
+                content.append("• [").append(record.id).append("] ")
+                       .append(date).append(" — <@").append(record.userId).append("> — ")
+                       .append(record.yourValue).append("/").append(record.theirValue)
+                       .append(" — ").append(record.verdict).append("\n");
+            }
+            
+            boolean ephemeral = !isAdmin(event.getMember());
+            event.reply(content.toString()).setEphemeral(ephemeral).queue();
+            
+        } catch (SQLException e) {
+            event.reply("❌ Failed to get history: " + e.getMessage()).setEphemeral(true).queue();
+        }
+    }
+    
+    private void handleSetBias(SlashCommandInteractionEvent event) {
+        if (!isAdmin(event.getMember())) {
+            event.reply("Admin only.").setEphemeral(true).queue();
+            return;
+        }
+        
+        String demandTag = event.getOption("demand_tag").getAsString();
+        double multiplier = event.getOption("multiplier").getAsDouble();
+        
+        try {
+            setBias(demandTag, multiplier);
+            event.reply("Set bias for " + demandTag + " = " + multiplier).setEphemeral(true).queue();
+        } catch (SQLException e) {
+            event.reply("❌ Failed to set bias: " + e.getMessage()).setEphemeral(true).queue();
+        }
+    }
+    
+    private static void registerCommands(JDA jda) {
+        List<OptionData> demandChoices = Arrays.asList(
+            new OptionData(OptionType.STRING, "demand_tag", "Demand tag", true)
+                .addChoice("high", "high")
+                .addChoice("normal", "normal")
+                .addChoice("low", "low")
+                .addChoice("terrible", "terrible")
+                .addChoice("rising", "rising")
+                .addChoice("ok", "ok"),
+            new OptionData(OptionType.STRING, "demand", "Demand level", true)
+                .addChoice("high", "high")
+                .addChoice("normal", "normal")
+                .addChoice("low", "low")
+                .addChoice("terrible", "terrible")
+                .addChoice("rising", "rising")
+                .addChoice("ok", "ok")
+        );
+        
+        jda.updateCommands().addCommands(
+            Commands.slash("evaluate", "Evaluate a trade between your items and their items")
+                .addOption(OptionType.STRING, "your_items", "Comma-separated list of your items", true)
+                .addOption(OptionType.STRING, "their_items", "Comma-separated list of their items", true)
+                .addOption(OptionType.STRING, "proof", "Optional proof link (screenshot, etc.)", false),
+                
+            Commands.slash("item_add", "[ADMIN] Add a new item to the database")
+                .addOption(OptionType.STRING, "name", "Item name", true)
+                .addOption(OptionType.INTEGER, "value", "Item value", true)
+                .addOptions(demandChoices.get(1)),
+                
+            Commands.slash("item_update", "[ADMIN] Update an existing item")
+                .addOption(OptionType.STRING, "name", "Item name", true)
+                .addOption(OptionType.INTEGER, "value", "New value (optional)", false)
+                .addOption(OptionType.STRING, "demand", "New demand level (optional)", false)
+                .getOptions().get(2).addChoice("high", "high").addChoice("normal", "normal")
+                .addChoice("low", "low").addChoice("terrible", "terrible")
+                .addChoice("rising", "rising").addChoice("ok", "ok").getParent(),
+                
+            Commands.slash("item_remove", "[ADMIN] Remove an item from the database")
+                .addOption(OptionType.STRING, "name", "Item name to remove", true),
+                
+            Commands.slash("list_export", "[ADMIN] Export the item list as CSV"),
+            
+            Commands.slash("history", "View trade evaluation history")
+                .addOption(OptionType.INTEGER, "limit", "Number of recent entries to show (default: 10)", false),
+                
+            Commands.slash("set_bias", "[ADMIN] Set demand bias multiplier")
+                .addOptions(demandChoices.get(0))
+                .addOption(OptionType.NUMBER, "multiplier", "Multiplier value", true)
+        ).queue();
+    }
+    
+    // Database operations
+    private static void initializeDatabase() throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            conn.createStatement().execute("""
+                CREATE TABLE IF NOT EXISTS items (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT UNIQUE,
+                    value INTEGER,
+                    demand TEXT
+                )
+            """);
+            
+            conn.createStatement().execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """);
+            
+            conn.createStatement().execute("""
+                CREATE TABLE IF NOT EXISTS history (
+                    id INTEGER PRIMARY KEY,
+                    user_id TEXT,
+                    timestamp INTEGER,
+                    your_items TEXT,
+                    their_items TEXT,
+                    your_value INTEGER,
+                    their_value INTEGER,
+                    verdict TEXT,
+                    proof TEXT
+                )
+            """);
+        }
+    }
+    
+    private static void seedDatabase() throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement countStmt = conn.prepareStatement("SELECT COUNT(*) FROM items");
+            ResultSet rs = countStmt.executeQuery();
+            rs.next();
+            int count = rs.getInt(1);
+            
+            if (count == 0) {
+                String[][] seedData = {
+                    {"Black Sparkle Time Fedora", "9000", "high"},
+                    {"Green Sparkle Time Fedora", "11000", "high"},
+                    {"Midnight Blue Sparkle Time Fedora", "18500", "normal"},
+                    {"Orange Sparkle Time Fedora", "4500", "normal"},
+                    {"Pink Sparkle Time Fedora", "7250", "normal"},
+                    {"Red Sparkle Time Fedora", "18500", "high"},
+                    {"Purple Sparkle Time Fedora", "2750", "low"},
+                    {"Sky Blue Sparkle Time Fedora", "8500", "low"},
+                    {"Sparkle Time Fedora", "4000", "low"},
+                    {"Blackvalk", "15000", "high"},
+                    {"Ice Valkyrie", "2500", "low"},
+                    {"Emerald Valkyrie", "7250", "normal"},
+                    {"Tixvalk", "2500", "low"},
+                    {"Valkyrie Helm", "0", "high"},
+                    {"Dominus Astra", "25000", "low"},
+                    {"Dominus Empyreus", "60000", "high"},
+                    {"Dominus Frigidus", "20000", "high"},
+                    {"Dominus Infernus", "35000", "low"},
+                    {"Dominus Messor", "2750", "low"},
+                    {"Dominus Praefectus", "1234", "terrible"},
+                    {"Dominus Rex", "5000", "low"},
+                    {"Dominus Vespertilio", "4500", "low"},
+                    {"Dominus Aureus", "14000", "low"},
+                    {"Domino Crown", "25000", "low"},
+                    {"Red Domino Crown", "16000", "terrible"},
+                    {"Disgraced Baron of the Federation", "4750", "low"},
+                    {"Duke of the Federation", "28500", "normal"},
+                    {"Earl of the Federation", "12000", "terrible"},
+                    {"Lord of the Federation", "55000", "low"},
+                    {"Viscount of the Federation", "1500", "low"},
+                    {"Clockwork's Headphones", "3000", "normal"},
+                    {"Clockwork's Shades", "3300", "normal"},
+                    {"Fiery Horns of the Netherworld", "6800", "normal"},
+                    {"Frozen Horns of the Frigid Planes", "0", "high"},
+                    {"Poisoned Horns of the Toxic Wasteland", "3000", "normal"},
+                    {"Red Void Star", "7500", "normal"},
+                    {"The Void Star", "3500", "high"},
+                    {"Silver King of the Night", "2500", "normal"},
+                    {"Bling $$ Necklace", "20000", "normal"},
+                    {"Eccentric Shop Teacher", "37500", "low"},
+                    {"Eerie Pumpkin Head", "12000", "low"},
+                    {"Rainbow Shaggy", "10000", "normal"},
+                    {"Subarctic Commando", "4500", "normal"},
+                    {"Transient Harmonica", "0", "ok"},
+                    {"Ghosdeeri", "4000", "normal"},
+                    {"Brighteyes' Bloxy Cola", "5500", "normal"},
+                    {"Interstellar Wings", "4500", "low"},
+                    {"Classic Fedora", "3000", "normal"},
+                    {"Telamon's Chicken Suit", "2500", "normal"},
+                    {"Telamon Hair", "5500", "low"},
+                    {"Playful Vampire", "0", "low"},
+                    {"Prankster", "3500", "high"},
+                    {"Red Glowing Eyes", "9000", "high"},
+                    {"Super Super Happy Face", "3000", "normal"},
+                    {"Yum!", "5500", "terrible"},
+                    {"Dual Darkhearts", "10000", "low"},
+                    {"Twin Kodachi", "2000", "rising"}
+                };
+                
+                PreparedStatement insertStmt = conn.prepareStatement(
+                    "INSERT INTO items(name, value, demand) VALUES(?, ?, ?)"
+                );
+                
+                for (String[] item : seedData) {
+                    insertStmt.setString(1, item[0]);
+                    insertStmt.setInt(2, Integer.parseInt(item[1]));
+                    insertStmt.setString(3, item[2]);
+                    insertStmt.addBatch();
+                }
+                
+                insertStmt.executeBatch();
+                System.out.println("Seeded database with default items.");
+            }
+        }
+        
+        // Set default biases if not present
+        if (getSetting("biases") == null) {
+            setSetting("biases", gson.toJson(DEFAULT_BIASES));
+        }
+    }
+    
+    private static String getSetting(String key) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement stmt = conn.prepareStatement("SELECT value FROM settings WHERE key = ?");
+            stmt.setString(1, key);
+            ResultSet rs = stmt.executeQuery();
+            return rs.next() ? rs.getString("value") : null;
+        }
+    }
+    
+    private static void setSetting(String key, String value) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement stmt = conn.prepareStatement(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)"
+            );
+            stmt.setString(1, key);
+            stmt.setString(2, value);
+            stmt.executeUpdate();
+        }
+    }
+    
+    private static Map<String, Double> getBiases() throws SQLException {
+        String biasesJson = getSetting("biases");
+        if (biasesJson != null) {
+            Type type = new TypeToken<Map<String, Double>>(){}.getType();
+            return gson.fromJson(biasesJson, type);
+        }
+        return DEFAULT_BIASES;
+    }
+    
+    private static void setBias(String tag, double multiplier) throws SQLException {
+        Map<String, Double> biases = getBiases();
+        biases.put(tag, multiplier);
+        setSetting("biases", gson.toJson(biases));
+    }
+    
+    private static List<String> parseItemsCSV(String itemsStr) {
+        if (itemsStr == null || itemsStr.trim().isEmpty()) {
+            return new ArrayList<>();
+        }
+        
+        return Arrays.asList(itemsStr.split(","))
+                     .stream()
+                     .map(String::trim)
+                     .filter(s -> !s.isEmpty())
+                     .collect(ArrayList::new, ArrayList::add, ArrayList::addAll);
+    }
+    
+    private static ItemValueResult getItemValueWithBias(String name) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement stmt = conn.prepareStatement(
+                "SELECT * FROM items WHERE name = ? COLLATE NOCASE"
+            );
+            stmt.setString(1, name);
+            ResultSet rs = stmt.executeQuery();
+            
+            if (!rs.next()) {
+                return new ItemValueResult(0, false, 0, null);
+            }
+            
+            int baseValue = rs.getInt("value");
+            String demand = rs.getString("demand");
+            
+            Map<String, Double> biases = getBiases();
+            double multiplier = biases.getOrDefault(demand, 1.0);
+            int adjustedValue = (int) Math.round(baseValue * multiplier);
+            
+            return new ItemValueResult(adjustedValue, true, baseValue, demand);
+        }
+    }
+    
+    private static TradeEvaluation evaluateTradeLogic(List<String> yourItems, List<String> theirItems) throws SQLException {
+        int yourValue = 0;
+        int theirValue = 0;
+        List<ItemDetail> yourDetails = new ArrayList<>();
+        List<ItemDetail> theirDetails = new ArrayList<>();
+        List<String> unfound = new ArrayList<>();
+        
+        // Calculate your items
+        for (String item : yourItems) {
+            ItemValueResult result = getItemValueWithBias(item);
+            yourValue += result.value;
+            yourDetails.add(new ItemDetail(item, result));
+            if (!result.found) {
+                unfound.add(item);
+            }
+        }
+        
+        // Calculate their items
+        for (String item : theirItems) {
+            ItemValueResult result = getItemValueWithBias(item);
+            theirValue += result.value;
+            theirDetails.add(new ItemDetail(item, result));
+            if (!result.found) {
+                unfound.add(item);
+            }
+        }
+        
+        int diff = theirValue - yourValue;
+        String verdict;
+        
+        if (diff >= 1000) {
+            verdict = "Accept";
+        } else if (diff <= -1000) {
+            verdict = "Decline";
+        } else {
+            verdict = "Fair / Consider demand";
+        }
+        
+        // Extra heuristic for high-demand items
+        long countHighTheir = theirDetails.stream()
+                                         .filter(d -> "high".equals(d.result.demand))
+                                         .count();
+        long countHighYour = yourDetails.stream()
+                                       .filter(d -> "high".equals(d.result.demand))
+                                       .count();
+        
+        if (countHighTheir - countHighYour >= 2 && diff >= -800) {
+            verdict = "Consider (their high-demand items)";
+        }
+        
+        int suggestedAdditional = yourValue > theirValue ? 
+                                 ((yourValue - theirValue) / 100 + 1) * 100 : 0;
+        int suggestedGiveback = theirValue > yourValue ? 
+                               ((theirValue - yourValue) / 100 + 1) * 100 : 0;
+        
+        return new TradeEvaluation(yourValue, theirValue, diff, verdict, 
+                                  yourDetails, theirDetails, unfound,
+                                  suggestedAdditional, suggestedGiveback);
+    }
+    
+    private static void addItem(String name, int value, String demand) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement stmt = conn.prepareStatement(
+                "INSERT INTO items(name, value, demand) VALUES(?, ?, ?)"
+            );
+            stmt.setString(1, name);
+            stmt.setInt(2, value);
+            stmt.setString(3, demand);
+            stmt.executeUpdate();
+        }
+    }
+    
+    private static void updateItem(String name, Integer value, String demand) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            if (value != null && demand != null) {
+                PreparedStatement stmt = conn.prepareStatement(
+                    "UPDATE items SET value = ?, demand = ? WHERE name = ?"
+                );
+                stmt.setInt(1, value);
+                stmt.setString(2, demand);
+                stmt.setString(3, name);
+                stmt.executeUpdate();
+            } else if (value != null) {
+                PreparedStatement stmt = conn.prepareStatement(
+                    "UPDATE items SET value = ? WHERE name = ?"
+                );
+                stmt.setInt(1, value);
+                stmt.setString(2, name);
+                stmt.executeUpdate();
+            } else if (demand != null) {
+                PreparedStatement stmt = conn.prepareStatement(
+                    "UPDATE items SET demand = ? WHERE name = ?"
+                );
+                stmt.setString(1, demand);
+                stmt.setString(2, name);
+                stmt.executeUpdate();
+            }
+        }
+    }
+    
+    private static void removeItem(String name) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement stmt = conn.prepareStatement("DELETE FROM items WHERE name = ?");
+            stmt.setString(1, name);
+            stmt.executeUpdate();
+        }
+    }
+    
+    private static List<Item> getAllItems() throws SQLException {
+        List<Item> items = new ArrayList<>();
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement stmt = conn.prepareStatement(
+                "SELECT * FROM items ORDER BY name COLLATE NOCASE"
+            );
+            ResultSet rs = stmt.executeQuery();
+            
+            while (rs.next()) {
+                items.add(new Item(rs.getInt("id"), rs.getString("name"), 
+                                 rs.getInt("value"), rs.getString("demand")));
+            }
+        }
+        return items;
+    }
+    
+    private static void addToHistory(String userId, List<String> yourItems, List<String> theirItems,
+                                    int yourValue, int theirValue, String verdict, String proof) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement stmt = conn.prepareStatement("""
+                INSERT INTO history(user_id, timestamp, your_items, their_items, your_value, their_value, verdict, proof)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """);
+            stmt.setString(1, userId);
+            stmt.setLong(2, System.currentTimeMillis());
+            stmt.setString(3, String.
+            stmt.setString(3, String.join(",", yourItems));
+            stmt.setString(4, String.join(",", theirItems));
+            stmt.setInt(5, yourValue);
+            stmt.setInt(6, theirValue);
+            stmt.setString(7, verdict);
+            stmt.setString(8, proof);
+            stmt.executeUpdate();
+        }
+    }
+
+    private static void updateLastHistoryVerdict(String newVerdict) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement stmt = conn.prepareStatement("""
+                UPDATE history
+                SET verdict = ?
+                WHERE id = (SELECT id FROM history ORDER BY timestamp DESC LIMIT 1)
+            """);
+            stmt.setString(1, newVerdict);
+            stmt.executeUpdate();
+        }
+    }
+
+    private static List<HistoryRecord> getHistory(int limit) throws SQLException {
+        List<HistoryRecord> history = new ArrayList<>();
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + DB_PATH)) {
+            PreparedStatement stmt = conn.prepareStatement(
+                "SELECT * FROM history ORDER BY timestamp DESC LIMIT ?"
+            );
+            stmt.setInt(1, limit);
+            ResultSet rs = stmt.executeQuery();
+            
+            while (rs.next()) {
+                history.add(new HistoryRecord(
+                    rs.getInt("id"),
+                    rs.getString("user_id"),
+                    rs.getLong("timestamp"),
+                    Arrays.asList(rs.getString("your_items").split(",")),
+                    Arrays.asList(rs.getString("their_items").split(",")),
+                    rs.getInt("your_value"),
+                    rs.getInt("their_value"),
+                    rs.getString("verdict"),
+                    rs.getString("proof")
+                ));
+            }
+        }
+        return history;
+    }
+
+    private static boolean isAdmin(Member member) {
+        if (member == null) return false;
+        return member.getRoles().stream().anyMatch(r -> r.getName().equalsIgnoreCase(ADMIN_ROLE_NAME));
+    }
+
+    private static EmbedBuilder buildEvaluationEmbed(User user, TradeEvaluation eval, String proof) {
+        EmbedBuilder embed = new EmbedBuilder();
+        embed.setTitle("Trade Evaluation");
+        embed.setColor(Color.CYAN);
+        embed.setDescription("<@" + user.getId() + ">'s trade evaluation results:");
+        
+        embed.addField("Your Total Value", String.valueOf(eval.yourValue), true);
+        embed.addField("Their Total Value", String.valueOf(eval.theirValue), true);
+        embed.addField("Verdict", eval.verdict, false);
+        
+        if (!eval.unfound.isEmpty()) {
+            embed.addField("Unknown Items", String.join(", ", eval.unfound), false);
+        }
+        
+        if (proof != null && !proof.isEmpty()) {
+            embed.addField("Proof", proof, false);
+        }
+        
+        return embed;
+    }
+
+    // Supporting classes
+    private static class Item {
+        int id;
+        String name;
+        int value;
+        String demand;
+
+        Item(int id, String name, int value, String demand) {
+            this.id = id;
+            this.name = name;
+            this.value = value;
+            this.demand = demand;
+        }
+    }
+
+    private static class ItemValueResult {
+        int value;
+        boolean found;
+        int baseValue;
+        String demand;
+
+        ItemValueResult(int value, boolean found, int baseValue, String demand) {
+            this.value = value;
+            this.found = found;
+            this.baseValue = baseValue;
+            this.demand = demand;
+        }
+    }
+
+    private static class ItemDetail {
+        String name;
+        ItemValueResult result;
+
+        ItemDetail(String name, ItemValueResult result) {
+            this.name = name;
+            this.result = result;
+        }
+    }
+
+    private static class TradeEvaluation {
+        int yourValue;
+        int theirValue;
+        int diff;
+        String verdict;
+        List<ItemDetail> yourDetails;
+        List<ItemDetail> theirDetails;
+        List<String> unfound;
+        int suggestedAdditional;
+        int suggestedGiveback;
+
+        TradeEvaluation(int yourValue, int theirValue, int diff, String verdict,
+                        List<ItemDetail> yourDetails, List<ItemDetail> theirDetails,
+                        List<String> unfound, int suggestedAdditional, int suggestedGiveback) {
+            this.yourValue = yourValue;
+            this.theirValue = theirValue;
+            this.diff = diff;
+            this.verdict = verdict;
+            this.yourDetails = yourDetails;
+            this.theirDetails = theirDetails;
+            this.unfound = unfound;
+            this.suggestedAdditional = suggestedAdditional;
+            this.suggestedGiveback = suggestedGiveback;
+        }
+    }
+
+    private static class HistoryRecord {
+        int id;
+        String userId;
+        long timestamp;
+        List<String> yourItems;
+        List<String> theirItems;
+        int yourValue;
+        int theirValue;
+        String verdict;
+        String proof;
+
+        HistoryRecord(int id, String userId, long timestamp, List<String> yourItems,
+                      List<String> theirItems, int yourValue, int theirValue,
+                      String verdict, String proof) {
+            this.id = id;
+            this.userId = userId;
+            this.timestamp = timestamp;
+            this.yourItems = yourItems;
+            this.theirItems = theirItems;
+            this.yourValue = yourValue;
+            this.theirValue = theirValue;
+            this.verdict = verdict;
+            this.proof = proof;
+        }
+    }
+}
